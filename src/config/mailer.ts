@@ -11,11 +11,33 @@ export interface MailOptions {
   replyTo?: string;
 }
 
-/** Parses `Name <email@host>` (or a bare address) into Brevo's sender shape. */
-function parseSender(raw: string): { name?: string; email: string } {
-  const m = /^\s*(.*?)\s*<\s*([^>]+?)\s*>\s*$/.exec(raw);
-  if (m) return { name: m[1] || undefined, email: m[2] };
-  return { email: raw.trim() };
+const EMAIL_RE = /[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+/;
+
+/**
+ * Parses a `from` value into Brevo's `{name, email}` sender shape.
+ *
+ * Accepts the RFC form `Name <email@host>`, a bare `email@host`, and also the
+ * bracket-less `Name email@host` — nodemailer's parser tolerated that, so
+ * existing .env files use it, but Brevo's JSON API needs the bare address.
+ * Surrounding quotes (a common dashboard-paste mistake) are stripped too.
+ */
+export function parseSender(raw: string): { name?: string; email: string } {
+  const cleaned = raw.trim().replace(/^["']|["']$/g, '').trim();
+
+  // `Name <email@host>`
+  const bracketed = /^(.*?)\s*<\s*([^>]+?)\s*>$/.exec(cleaned);
+  if (bracketed) {
+    return { name: bracketed[1].trim() || undefined, email: bracketed[2].trim() };
+  }
+
+  // `Name email@host` or a bare `email@host`
+  const m = EMAIL_RE.exec(cleaned);
+  if (m) {
+    const name = cleaned.replace(m[0], '').trim();
+    return { name: name || undefined, email: m[0] };
+  }
+
+  return { email: cleaned };
 }
 
 function senderFromEnv(): { name?: string; email: string } {
@@ -42,8 +64,13 @@ export async function sendMail({ to, subject, html, replyTo }: MailOptions): Pro
   // ── Production path: Brevo HTTPS API ──
   if (apiKey) {
     const sender = senderFromEnv();
-    if (!sender.email) {
-      throw new Error('SMTP_FROM (or SMTP_USER) must be set to a Brevo-verified sender address');
+    if (!EMAIL_RE.test(sender.email)) {
+      // Fail loudly and locally — Brevo's "valid sender email required" 400 is
+      // too vague to debug from.
+      throw new Error(
+        `SMTP_FROM must contain a valid sender address (parsed "${sender.email}" from ` +
+          `"${process.env.SMTP_FROM ?? ''}"). Expected e.g. PulseSpend <you@example.com>`,
+      );
     }
 
     const res = await fetch(BREVO_ENDPOINT, {
